@@ -23,7 +23,8 @@ Route::middleware(['auth', 'account.active'])->group(function () {
     Route::post('/meetings/{meeting}/generate', [MeetingController::class, 'generate'])->middleware('throttle:8,1')->name('meetings.generate');
     Route::post('/meetings/{meeting}/sync-drive', [MeetingController::class, 'syncDrive'])->middleware('throttle:8,1')->name('meetings.sync-drive');
     Route::post('/meetings/{meeting}/retry', [MeetingController::class, 'generate'])->name('meetings.retry');
-    Route::get('/meetings/{meeting}/word', [MeetingController::class, 'word'])->name('meetings.word');
+    Route::get('/meetings/{meeting}/pdf', [MeetingController::class, 'pdf'])->name('meetings.pdf');
+    Route::get('/meetings/{meeting}/word', [MeetingController::class, 'pdf'])->name('meetings.word'); // kompatibilitas tautan lama
     Route::get('/meetings/{meeting}/audio', [MeetingController::class, 'audio'])->name('meetings.audio');
     Route::middleware('can:manage-settings')->group(function () {
         Route::get('/settings/recipients', [SettingController::class, 'recipients'])->name('settings.recipients');

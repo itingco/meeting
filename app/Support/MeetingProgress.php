@@ -11,7 +11,7 @@ class MeetingProgress
         'combining' => 'Menggabungkan potongan audio',
         'transcribing' => 'AI sedang mentranskripsi rekaman',
         'summarizing' => 'AI menyusun notulen',
-        'document' => 'Membuat dokumen Word',
+        'document' => 'Membuat dokumen PDF',
         'email' => 'Mengirim email notulen',
         'completed' => 'Notulen selesai',
         'failed' => 'Proses mengalami kegagalan',
@@ -35,13 +35,13 @@ class MeetingProgress
             $meeting->status === 'queued' => 'Tidak ada job processing yang terdeteksi. Gunakan tombol Generate Notulen untuk menjadwalkan ulang.',
             $meeting->status === 'processing' => 'Worker memproses. Jika tahap ini tidak berubah lama, cek storage/logs/processing-worker.log dan laravel.log.',
             $meeting->status === 'failed' => 'Baca penyebab kegagalan di bawah, perbaiki konfigurasi, lalu gunakan Generate Notulen.',
-            $meeting->status === 'completed' => 'Word selesai. Status email dan backup Drive ditampilkan terpisah.',
+            $meeting->status === 'completed' => 'PDF selesai. Status email dan backup Drive ditampilkan terpisah.',
             default => 'Rekaman masih berlangsung atau menunggu penyelesaian.',
         };
         if (!config('meeting.drive_enabled')) $driveHint = 'Backup Drive nonaktif pada .env.';
         elseif ($failed) $driveHint = 'Ada '.$failed.' bagian gagal upload. Lihat error Drive dan gunakan Sinkronkan Drive.';
         elseif ($uploaded < $chunks) $driveHint = 'Backup Drive '.$uploaded.'/'.$chunks.' bagian; antrean Drive '.$driveQueue.' job.';
-        elseif ($chunks > 0) $driveHint = 'Semua '.$chunks.' bagian audio berhasil diupload ke Drive. File final/Word diproses terpisah.';
+        elseif ($chunks > 0) $driveHint = 'Semua '.$chunks.' bagian audio berhasil diupload ke Drive. File final/PDF diproses terpisah.';
         else $driveHint = 'Belum ada bagian audio di server.';
         return [
             'stage' => $stage,

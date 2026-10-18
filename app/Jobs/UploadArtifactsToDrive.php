@@ -26,9 +26,9 @@ class UploadArtifactsToDrive implements ShouldQueue
         $meeting->update(['drive_status'=>'uploading','drive_error'=>null]);
         try {
             $storage=Storage::disk('local');
-            if (!$meeting->audio_path && !$meeting->document_path) throw new RuntimeException('Belum ada file final/Word untuk di-upload.');
+            if (!$meeting->audio_path && !$meeting->document_path) throw new RuntimeException('Belum ada file final/PDF untuk di-upload.');
             if ($meeting->audio_path) $drive->upload($meeting,$storage->path($meeting->audio_path),'rekaman-final.m4a','audio/mp4');
-            if ($meeting->document_path) $drive->upload($meeting,$storage->path($meeting->document_path),'notulen.docx','application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+            if ($meeting->document_path && str_ends_with(strtolower($meeting->document_path), '.pdf')) $drive->upload($meeting,$storage->path($meeting->document_path),'notulen.pdf','application/pdf');
             $meeting->update(['drive_status'=>'uploaded','drive_error'=>null]);
         } catch (Throwable $e) {
             $meeting->update(['drive_status'=>'failed','drive_error'=>mb_substr($e->getMessage(),0,600)]);

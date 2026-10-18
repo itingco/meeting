@@ -4,7 +4,7 @@
 <meta name="csrf-token" content="{{ csrf_token() }}">
 <meta name="theme-color" content="#142a42">
 <title>@yield('title','Meeting AI') • INGCO</title>
-<link rel="stylesheet" href="{{ asset('css/app.css') }}?v=20261015">
+<link rel="stylesheet" href="{{ asset('css/app.css') }}?v=20261018pdf">
 </head><body>
 <div class="shell">
 <header class="topbar">

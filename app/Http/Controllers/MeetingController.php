@@ -55,7 +55,7 @@ class MeetingController extends Controller
             'chunks' => $meeting->chunks()->count(), 'expected_chunks' => $meeting->expected_chunks,
             'drive_status' => $meeting->drive_status, 'emailed_at' => $meeting->emailed_at?->toIso8601String(),
             'error' => $meeting->error_message,
-            'document_url' => $meeting->document_path ? route('meetings.word', $meeting) : null,
+            'document_url' => ($meeting->document_path && str_ends_with(strtolower($meeting->document_path), '.pdf')) ? route('meetings.pdf', $meeting) : null,
             'meeting_url' => route('meetings.show', $meeting),
             'progress' => MeetingProgress::snapshot($meeting),
         ]);
@@ -135,9 +135,9 @@ class MeetingController extends Controller
             $messages[]="Drive: {$chunksQueued} potongan dijadwalkan".($missing ? ", {$missing} file lokal hilang" : '');
         } else $messages[]='Drive belum aktif pada .env';
 
-        if ($meeting->status === 'completed' && $meeting->document_path) {
+        if ($meeting->status === 'completed' && $meeting->document_path && str_ends_with(strtolower($meeting->document_path), '.pdf')) {
             $messages[]='Notulen sudah tersedia';
-        } elseif (!config('meeting.demo_ai') && !config('services.openai.key')) {
+        } elseif (!config('meeting.demo_ai') && (config('meeting.transcription_provider') === 'openai' && !config('services.openai.key'))) {
             $messages[]='AI belum dijadwalkan: OPENAI_API_KEY belum diisi';
         } elseif ($meeting->status==='processing' && $meeting->stage_updated_at && $meeting->stage_updated_at->gt(now()->subMinutes(60))) {
             $messages[]='AI masih berjalan; tidak dijadwalkan duplikat';
@@ -154,9 +154,9 @@ class MeetingController extends Controller
     {
         $this->mayChange($request, $meeting);
         if ($meeting->status==='recording') return back()->with('error','Akhiri perekaman terlebih dahulu.');
-        if ($meeting->status==='completed' && $meeting->document_path) return back()->with('message','Notulen sudah selesai. Gunakan tombol unduh Word.');
+        if ($meeting->status==='completed' && $meeting->document_path && str_ends_with(strtolower($meeting->document_path), '.pdf')) return back()->with('message','Notulen sudah selesai. Gunakan tombol unduh PDF.');
         if (!$meeting->chunks()->exists()) return back()->with('error','Belum ada potongan rekaman di server.');
-        if (!config('meeting.demo_ai') && !config('services.openai.key')) {
+        if (!config('meeting.demo_ai') && (config('meeting.transcription_provider') === 'openai' && !config('services.openai.key'))) {
             return back()->with('error','OPENAI_API_KEY belum diisi di .env. Generation belum dapat berjalan.');
         }
         if ($meeting->status==='processing' && $meeting->stage_updated_at && $meeting->stage_updated_at->gt(now()->subMinutes(60))) {
@@ -182,15 +182,15 @@ class MeetingController extends Controller
             UploadArtifactsToDrive::dispatch($meeting->id);
         }
         $message="Sinkronisasi Drive dijadwalkan: {$count} bagian audio";
-        if ($meeting->audio_path || $meeting->document_path) $message.=', termasuk pemeriksaan file final/Word';
+        if ($meeting->audio_path || $meeting->document_path) $message.=', termasuk pemeriksaan file final/PDF';
         if ($missing) $message.=". Ada {$missing} file lokal yang hilang";
         return back()->with('message',$message.'. Pantau antrean dan progres Drive di bawah.');
     }
-    public function word(Request $request, Meeting $meeting)
+    public function pdf(Request $request, Meeting $meeting)
     {
         $this->mayRead($request, $meeting);
-        if (!$meeting->document_path || !Storage::disk('local')->exists($meeting->document_path)) abort(404);
-        return Storage::disk('local')->download($meeting->document_path,'Notulen-'.Str::slug($meeting->title).'.docx');
+        if (!$meeting->document_path || !str_ends_with(strtolower($meeting->document_path), '.pdf') || !Storage::disk('local')->exists($meeting->document_path)) abort(404, 'PDF belum dibuat. Untuk data lama, jalankan php artisan meeting:pdf-backfill --apply.');
+        return Storage::disk('local')->download($meeting->document_path,'Notulen-'.Str::slug($meeting->title).'.pdf', ['Content-Type'=>'application/pdf']);
     }
     public function audio(Request $request, Meeting $meeting)
     {

@@ -4,7 +4,7 @@ use App\Mail\MeetingMinutesMail;
 use App\Models\Meeting;
 use App\Models\MeetingRecipient;
 use App\Services\MeetingAiService;
-use App\Services\WordMinutesService;
+use App\Services\PdfMinutesService;
 use App\Support\MeetingProgress;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -30,7 +30,7 @@ class ProcessMeeting implements ShouldQueue
         $meeting->update(['process_stage'=>$name,'stage_updated_at'=>now()]);
         Log::info('Meeting AI progress',['meeting_id'=>$meeting->id,'uuid'=>$meeting->uuid,'stage'=>$name]);
     }
-    public function handle(MeetingAiService $ai, WordMinutesService $word): void
+    public function handle(MeetingAiService $ai, PdfMinutesService $pdf): void
     {
         // Claim secara atomik: job lama/duplikat tidak boleh memproses meeting bersamaan.
         $claimed=Meeting::whereKey($this->meetingId)->where('status','queued')->update([
@@ -87,9 +87,9 @@ class ProcessMeeting implements ShouldQueue
                 $this->stage($meeting,'summarizing');
                 $meeting->update(['notes'=>$ai->makeNotes($meeting,$meeting->transcript)]);
             }
-            if (!$meeting->document_path || !$storage->exists($meeting->document_path)) {
+            if (!$meeting->document_path || !str_ends_with(strtolower($meeting->document_path), '.pdf') || !$storage->exists($meeting->document_path)) {
                 $this->stage($meeting,'document');
-                $meeting->update(['document_path'=>$word->create($meeting)]);
+                $meeting->update(['document_path'=>$pdf->create($meeting)]);
             }
             if (config('meeting.mail_enabled') && !$meeting->emailed_at) {
                 $this->stage($meeting,'email');

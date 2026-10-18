@@ -12,6 +12,120 @@
   let active = null, recorder = null, stream = null, wakeLock = null;
   let sequence = 0, uploadBusy = false, finalizeBusy = false, ticking = null;
   let persistTasks = [], manualStopRequested = false;
+  // Live microphone meter uses the SAME MediaStream as MediaRecorder; no second permission.
+  // It is input level only: it does not send audio and is not a speech recognizer.
+  const meterCanvas = $('mic-waveform');
+  const meterPanel = meterCanvas?.closest('.audio-meter');
+  const meterSignal = $('mic-signal-label');
+  const meterLevel = $('mic-level-label');
+  let meterContext = null, meterSource = null, meterAnalyser = null;
+  let meterFrame = 0, meterArray = null, meterRms = null, meterSmoothed = [];
+  let lastVoice = false;
+  const setMeterLabel = (label, value, speaking = false, running = false) => {
+    if (meterSignal) meterSignal.textContent = label;
+    if (meterLevel) meterLevel.textContent = value;
+    if (meterPanel) {
+      meterPanel.classList.toggle('is-live', running);
+      meterPanel.classList.toggle('is-speaking', speaking && running);
+    }
+  };
+  const drawMeter = (levels = [], speaking = false) => {
+    if (!meterCanvas) return;
+    const ctx = meterCanvas.getContext('2d');
+    if (!ctx) return;
+    const rect = meterCanvas.getBoundingClientRect();
+    const width = Math.max(140, rect.width || 400);
+    const height = Math.max(50, rect.height || 84);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = Math.round(width * dpr), h = Math.round(height * dpr);
+    if (meterCanvas.width !== w || meterCanvas.height !== h) {
+      meterCanvas.width = w; meterCanvas.height = h;
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+    const mid = height / 2;
+    ctx.beginPath(); ctx.moveTo(0, mid); ctx.lineTo(width, mid);
+    ctx.strokeStyle = '#dce6ee'; ctx.lineWidth = 1; ctx.stroke();
+    const bars = 48, gutter = 3;
+    const bw = Math.max(2, (width - (bars - 1) * gutter) / bars);
+    const step = (width - bw) / (bars - 1);
+    ctx.fillStyle = speaking ? '#26a47b' : '#efa500';
+    for (let i = 0; i < bars; i++) {
+      const amp = Math.min(1, Math.max(0, levels[i] || 0));
+      const bh = 3 + amp * Math.max(8, height - 10);
+      const x = i * step;
+      if (typeof ctx.roundRect === 'function') {
+        ctx.beginPath(); ctx.roundRect(x, mid - bh / 2, bw, bh, bw / 2); ctx.fill();
+      } else {
+        ctx.fillRect(x, mid - bh / 2, bw, bh);
+      }
+    }
+  };
+  const stopMeter = async () => {
+    if (meterFrame) cancelAnimationFrame(meterFrame);
+    meterFrame = 0;
+    try { meterSource?.disconnect(); } catch (_) {}
+    try { meterAnalyser?.disconnect(); } catch (_) {}
+    meterSource = null; meterAnalyser = null; meterArray = null; meterRms = null;
+    const ctx = meterContext; meterContext = null;
+    if (ctx) { try { await ctx.close(); } catch (_) {} }
+    meterSmoothed = []; lastVoice = false;
+    drawMeter(); setMeterLabel('Mikrofon tidak aktif', '--');
+  };
+  const startMeter = async audioStream => {
+    await stopMeter();
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx || !meterCanvas?.getContext) {
+      setMeterLabel('Grafik tidak didukung browser', '--'); return;
+    }
+    try {
+      meterContext = new AudioCtx();
+      meterSource = meterContext.createMediaStreamSource(audioStream);
+      meterAnalyser = meterContext.createAnalyser();
+      meterAnalyser.fftSize = 1024;
+      meterAnalyser.smoothingTimeConstant = 0.67;
+      meterSource.connect(meterAnalyser); // Never connect to speakers (no feedback).
+      meterArray = new Uint8Array(meterAnalyser.frequencyBinCount);
+      meterRms = new Uint8Array(meterAnalyser.fftSize);
+      if (meterContext.state === 'suspended') await meterContext.resume();
+      let previousLabel = 0;
+      const frame = t => {
+        if (!meterAnalyser || !meterContext) return;
+        meterAnalyser.getByteFrequencyData(meterArray);
+        meterAnalyser.getByteTimeDomainData(meterRms);
+        let sum = 0;
+        for (let i = 0; i < meterRms.length; i++) {
+          const v = (meterRms[i] - 128) / 128;
+          sum += v * v;
+        }
+        const rms = Math.sqrt(sum / meterRms.length);
+        // Input-level threshold; not a guarantee that speech is intelligible.
+        const speaking = rms >= 0.018;
+        const sensitivity = Math.min(1, rms * 10);
+        const bars = 48;
+        for (let i = 0; i < bars; i++) {
+          const index = Math.min(meterArray.length - 1, 2 + Math.floor(Math.pow(i / bars, 1.65) * 180));
+          const spectrum = meterArray[index] / 255;
+          const amount = speaking ? Math.min(1, spectrum * 1.6 * (0.3 + sensitivity * 1.3)) : 0;
+          const prior = meterSmoothed[i] || 0;
+          meterSmoothed[i] = prior * 0.65 + amount * 0.35;
+        }
+        drawMeter(meterSmoothed, speaking);
+        if (speaking !== lastVoice || t - previousLabel > 450) {
+          setMeterLabel(speaking ? 'Ada suara masuk' : 'Suara rendah / hening',
+            speaking ? 'INPUT AKTIF' : 'INPUT RENDAH', speaking, true);
+          previousLabel = t; lastVoice = speaking;
+        }
+        meterFrame = requestAnimationFrame(frame);
+      };
+      setMeterLabel('Memantau input suara…', 'INPUT AKTIF', false, true);
+      meterFrame = requestAnimationFrame(frame);
+    } catch (err) {
+      // Visualizer is an enhancement: never fail or stop MediaRecorder for it.
+      await stopMeter();
+      setMeterLabel('Grafik tidak tersedia; rekaman tetap berjalan', '--');
+    }
+  };
   const dateStart = () => active?.started ? Date.now() - active.started : 0;
 
   const openDb = () => new Promise((resolve, reject) => {
@@ -99,6 +213,7 @@
     ticking = setInterval(() => { if (active?.started) $('record-timer').textContent = formatTime(dateStart()/1000); },1000);
   };
   const releaseMic = async () => {
+    await stopMeter();
     if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
     try { if (wakeLock) await wakeLock.release(); } catch (e) {}
     wakeLock = null;
@@ -212,6 +327,7 @@
         if (recorder?.state === 'recording') recorder.stop();
       }));
       recorder.start(15000);
+      await startMeter(stream);
       try { if (navigator.wakeLock) wakeLock=await navigator.wakeLock.request('screen'); } catch(e) {}
       $('record-timer').textContent='00:00:00'; startTimer(); await render();
       notify('Rekaman aktif. Pertahankan halaman ini terbuka dan layar tetap menyala.');
@@ -259,5 +375,6 @@
   document.addEventListener('visibilitychange', ()=>{
     if (document.hidden && recorder?.state==='recording') notify('Peringatan: browser mobile dapat menghentikan rekaman di background.');
   });
+  drawMeter();
   init();
 })();
