@@ -47,20 +47,77 @@ class ProcessMeeting implements ShouldQueue
             if (!$meeting->audio_path || !$storage->exists($meeting->audio_path)) {
                 $this->stage($meeting,'combining');
                 $ext=str_contains((string)$meeting->mime_type,'mp4')?'mp4':(str_contains((string)$meeting->mime_type,'ogg')?'ogg':'webm');
-                $raw=$base.'/gabungan.'.$ext;
                 $storage->makeDirectory($base);
-                $output=fopen($storage->path($raw),'wb');
-                if (!$output) throw new RuntimeException('Gagal membuat file audio gabungan.');
-                try {
-                    foreach ($chunks as $chunk) {
-                        if (!$storage->exists($chunk->local_path)) throw new RuntimeException('Potongan audio #'.$chunk->sequence.' hilang.');
-                        $input=fopen($storage->path($chunk->local_path),'rb');
-                        if (!$input) throw new RuntimeException('Gagal membaca potongan #'.$chunk->sequence);
-                        try { stream_copy_to_stream($input,$output); } finally { fclose($input); }
+
+                /*
+                 * Satu MediaRecorder menghasilkan chunk yang memang harus disambung byte-per-byte.
+                 * Tetapi setelah browser/OS memutus mic (mis. lock/unlock), recorder baru akan membuat
+                 * header container baru. Kita pecah menjadi beberapa capture session, gabungkan chunk
+                 * di dalam tiap session secara binary, lalu concat session lengkap memakai FFmpeg.
+                 *
+                 * Ini tetap kompatibel dengan rekaman lama yang hanya memiliki satu MediaRecorder.
+                 */
+                $groups=[]; $current=[];
+                foreach ($chunks as $index=>$chunk) {
+                    if (!$storage->exists($chunk->local_path)) {
+                        throw new RuntimeException('Potongan audio #'.$chunk->sequence.' hilang.');
                     }
-                } finally { fclose($output); }
+                    $startsNewSession = $index===0 || $this->startsNewContainer(
+                        $storage->path($chunk->local_path),
+                        (string)$meeting->mime_type
+                    );
+                    if ($startsNewSession && $current) {
+                        $groups[]=$current;
+                        $current=[];
+                    }
+                    $current[]=$chunk;
+                }
+                if ($current) $groups[]=$current;
+
+                $sessionFiles=[];
+                foreach ($groups as $groupIndex=>$group) {
+                    $sessionRelative=$base.'/capture-session-'.str_pad((string)$groupIndex,3,'0',STR_PAD_LEFT).'.'.$ext;
+                    $output=fopen($storage->path($sessionRelative),'wb');
+                    if (!$output) throw new RuntimeException('Gagal membuat file audio session.');
+                    try {
+                        foreach ($group as $chunk) {
+                            $input=fopen($storage->path($chunk->local_path),'rb');
+                            if (!$input) throw new RuntimeException('Gagal membaca potongan #'.$chunk->sequence);
+                            try { stream_copy_to_stream($input,$output); } finally { fclose($input); }
+                        }
+                    } finally { fclose($output); }
+                    $sessionFiles[]=$storage->path($sessionRelative);
+                }
+
                 $final=$base.'/rekaman-final.m4a';
-                $this->ffmpeg(['-nostdin','-hide_banner','-loglevel','error','-y','-i',$storage->path($raw),'-vn','-ac','1','-ar','16000','-c:a','aac','-b:a','48k',$storage->path($final)]);
+                if (count($sessionFiles)===1) {
+                    $this->ffmpeg([
+                        '-nostdin','-hide_banner','-loglevel','error','-y',
+                        '-i',$sessionFiles[0],
+                        '-vn','-ac','1','-ar','16000','-c:a','aac','-b:a','48k',
+                        $storage->path($final)
+                    ]);
+                } else {
+                    $concatRelative=$base.'/capture-sessions.ffconcat';
+                    $lines=['ffconcat version 1.0'];
+                    foreach ($sessionFiles as $sessionFile) {
+                        $normalized=str_replace('\\','/',$sessionFile);
+                        $escaped=str_replace("'", "\\'",$normalized);
+                        $lines[]="file '".$escaped."'";
+                    }
+                    $storage->put($concatRelative,implode(PHP_EOL,$lines).PHP_EOL);
+                    Log::warning('Meeting recording recovered across multiple browser capture sessions',[
+                        'meeting_id'=>$meeting->id,
+                        'uuid'=>$meeting->uuid,
+                        'sessions'=>count($sessionFiles),
+                    ]);
+                    $this->ffmpeg([
+                        '-nostdin','-hide_banner','-loglevel','error','-y',
+                        '-f','concat','-safe','0','-i',$storage->path($concatRelative),
+                        '-vn','-ac','1','-ar','16000','-c:a','aac','-b:a','48k',
+                        $storage->path($final)
+                    ]);
+                }
                 $meeting->update(['audio_path'=>$final]);
             }
             if (!$meeting->transcript) {
@@ -112,6 +169,24 @@ class ProcessMeeting implements ShouldQueue
             $this->recordFailure($e);
             throw $e;
         }
+    }
+    private function startsNewContainer(string $path, string $mime): bool
+    {
+        $handle=fopen($path,'rb');
+        if (!$handle) return false;
+        try { $head=fread($handle,16); } finally { fclose($handle); }
+        if (!is_string($head) || $head==='') return false;
+
+        if (str_contains($mime,'webm')) {
+            return str_starts_with($head,"\x1A\x45\xDF\xA3");
+        }
+        if (str_contains($mime,'mp4') || str_contains($mime,'x-m4a')) {
+            return strlen($head)>=8 && substr($head,4,4)==='ftyp';
+        }
+
+        // Ogg pages can all begin with OggS, so the signature alone cannot safely
+        // distinguish a new MediaRecorder session from the next page in the same one.
+        return false;
     }
     private function recordFailure(Throwable $e): void
     {

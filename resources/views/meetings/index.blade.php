@@ -22,9 +22,9 @@
 <div class="upload-info"><div><span id="record-uploaded">0</span> bagian tersimpan di server</div><div id="record-pending">Cadangan lokal: 0</div></div>
 <div class="alert warning hidden" id="recovery-notice"><b>Rekaman sebelumnya ditemukan.</b><p id="recovery-text">Potongan yang sempat tersimpan di perangkat akan dikirim ulang.</p><button class="button secondary" id="recover-button">Sinkronkan &amp; Selesaikan</button></div>
 <div class="alert error hidden" id="recorder-error"></div><div class="alert success hidden" id="recorder-success"></div>
-<p class="muted mini">Biarkan halaman aktif dan layar HP menyala selama merekam. Setelah berhenti Anda otomatis diarahkan ke halaman progres. HTTPS diperlukan untuk akses mikrofon dari HP lain.</p>
+<p class="muted mini">Saat merekam, aplikasi akan meminta Screen Wake Lock agar layar tidak mati otomatis pada browser yang mendukung. Jika layar dikunci manual atau OS menghentikan mikrofon, aplikasi akan mencoba melanjutkan rekaman saat layar dibuka kembali. Audio pada saat mikrofon benar-benar dihentikan oleh OS tidak dapat dipulihkan. HTTPS tetap diperlukan untuk akses mikrofon.</p>
 </section>
-<aside class="stack aside"><section class="panel feature-card"><div class="mini-icon amber">☁</div><h3>Backup bertahap</h3><p>Potongan audio dikirim ke server sekitar setiap 15 detik dan diupload ke Google Drive melalui antrean.</p></section><section class="panel feature-card"><div class="mini-icon blue">✧</div><h3>Status terpantau</h3><p>Lihat jumlah antrean, jumlah audio yang sudah masuk Drive, tahap transkripsi, PDF, dan email.</p></section><section class="panel feature-card"><div class="mini-icon green">✉</div><h3>PDF &amp; email</h3><p>Hasil ditujukan ke <b>{{ config('meeting.initial_recipient') }}</b> ketika pengiriman email diaktifkan.</p><p class="mini muted">Pengiriman: {{ config('meeting.mail_enabled') ? 'aktif' : 'nonaktif' }}</p></section></aside>
+<aside class="stack aside"><section class="panel feature-card"><div class="mini-icon amber">☁</div><h3>Backup bertahap</h3><p>Potongan audio dikirim ke server sekitar setiap 15 detik dan diupload ke Google Drive melalui antrean. Saat halaman masuk background, recorder juga diminta menutup chunk aktif agar bagian terakhir lebih aman.</p></section><section class="panel feature-card"><div class="mini-icon blue">✧</div><h3>Status terpantau</h3><p>Lihat jumlah antrean, jumlah audio yang sudah masuk Drive, tahap transkripsi, PDF, dan email.</p></section><section class="panel feature-card"><div class="mini-icon green">✉</div><h3>PDF &amp; email</h3><p>Hasil ditujukan ke <b>{{ config('meeting.initial_recipient') }}</b> ketika pengiriman email diaktifkan.</p><p class="mini muted">Pengiriman: {{ config('meeting.mail_enabled') ? 'aktif' : 'nonaktif' }}</p></section></aside>
 </div>
 @if($historyAccess)
 <section class="panel list-panel"><div class="section-heading"><div><div class="eyebrow">RIWAYAT MEETING</div><h2>Rekaman terbaru</h2></div><span class="muted mini">{{ $meetings->total() }} meeting</span></div>
@@ -36,5 +36,5 @@
 @else
 <div class="alert warning">Akun Anda dapat merekam meeting. Riwayat meeting seluruh pengguna hanya tersedia bagi akun yang diberikan izin History. Hasil meeting yang baru Anda rekam tetap dapat diakses setelah berhenti.</div>
 @endif
-<script defer src="{{ asset('js/recorder.js') }}?v=20261018pdf"></script>
+<script defer src="{{ asset('js/recorder.js') }}?v=20261027lockfix1"></script>
 @endsection

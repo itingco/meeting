@@ -1,5 +1,6 @@
 /* INGCO Meeting AI: browser-side crash/reconnect recovery via IndexedDB.
-   Browser background audio is NOT guaranteed (notably iOS). */
+   Mobile browsers can still suspend microphone capture when the OS locks the screen.
+   This file prevents automatic screen sleep where supported and resumes capture after interruptions. */
 (() => {
   'use strict';
   const root = document.getElementById('recorder-root');
@@ -9,9 +10,21 @@
   const base = root.dataset.urlBase;
   const micButton = $('mic-circle');
   const recoveryNotice = $('recovery-notice'), recoverButton = $('recover-button');
+
   let active = null, recorder = null, stream = null, wakeLock = null;
   let sequence = 0, uploadBusy = false, finalizeBusy = false, ticking = null;
   let persistTasks = [], manualStopRequested = false;
+  let resumeBusy = false, unexpectedStopBusy = false, wakeLockWarningShown = false;
+
+  const audioConstraints = {
+    video: false,
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      channelCount: 1,
+    },
+  };
+
   // Live microphone meter uses the SAME MediaStream as MediaRecorder; no second permission.
   // It is input level only: it does not send audio and is not a speech recognizer.
   const meterCanvas = $('mic-waveform');
@@ -21,6 +34,9 @@
   let meterContext = null, meterSource = null, meterAnalyser = null;
   let meterFrame = 0, meterArray = null, meterRms = null, meterSmoothed = [];
   let lastVoice = false;
+
+  const isRecording = () => !!recorder && recorder.state === 'recording';
+
   const setMeterLabel = (label, value, speaking = false, running = false) => {
     if (meterSignal) meterSignal.textContent = label;
     if (meterLevel) meterLevel.textContent = value;
@@ -29,6 +45,7 @@
       meterPanel.classList.toggle('is-speaking', speaking && running);
     }
   };
+
   const drawMeter = (levels = [], speaking = false) => {
     if (!meterCanvas) return;
     const ctx = meterCanvas.getContext('2d');
@@ -61,6 +78,7 @@
       }
     }
   };
+
   const stopMeter = async () => {
     if (meterFrame) cancelAnimationFrame(meterFrame);
     meterFrame = 0;
@@ -72,6 +90,7 @@
     meterSmoothed = []; lastVoice = false;
     drawMeter(); setMeterLabel('Mikrofon tidak aktif', '--');
   };
+
   const startMeter = async audioStream => {
     await stopMeter();
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -84,7 +103,7 @@
       meterAnalyser = meterContext.createAnalyser();
       meterAnalyser.fftSize = 1024;
       meterAnalyser.smoothingTimeConstant = 0.67;
-      meterSource.connect(meterAnalyser); // Never connect to speakers (no feedback).
+      meterSource.connect(meterAnalyser);
       meterArray = new Uint8Array(meterAnalyser.frequencyBinCount);
       meterRms = new Uint8Array(meterAnalyser.fftSize);
       if (meterContext.state === 'suspended') await meterContext.resume();
@@ -99,7 +118,6 @@
           sum += v * v;
         }
         const rms = Math.sqrt(sum / meterRms.length);
-        // Input-level threshold; not a guarantee that speech is intelligible.
         const speaking = rms >= 0.018;
         const sensitivity = Math.min(1, rms * 10);
         const bars = 48;
@@ -112,8 +130,12 @@
         }
         drawMeter(meterSmoothed, speaking);
         if (speaking !== lastVoice || t - previousLabel > 450) {
-          setMeterLabel(speaking ? 'Ada suara masuk' : 'Suara rendah / hening',
-            speaking ? 'INPUT AKTIF' : 'INPUT RENDAH', speaking, true);
+          setMeterLabel(
+            speaking ? 'Ada suara masuk' : 'Suara rendah / hening',
+            speaking ? 'INPUT AKTIF' : 'INPUT RENDAH',
+            speaking,
+            true
+          );
           previousLabel = t; lastVoice = speaking;
         }
         meterFrame = requestAnimationFrame(frame);
@@ -121,15 +143,18 @@
       setMeterLabel('Memantau input suara…', 'INPUT AKTIF', false, true);
       meterFrame = requestAnimationFrame(frame);
     } catch (err) {
-      // Visualizer is an enhancement: never fail or stop MediaRecorder for it.
       await stopMeter();
       setMeterLabel('Grafik tidak tersedia; rekaman tetap berjalan', '--');
     }
   };
+
   const dateStart = () => active?.started ? Date.now() - active.started : 0;
 
   const openDb = () => new Promise((resolve, reject) => {
-    if (!window.indexedDB) { reject(new Error('Browser ini tidak mendukung IndexedDB untuk cadangan lokal.')); return; }
+    if (!window.indexedDB) {
+      reject(new Error('Browser ini tidak mendukung IndexedDB untuk cadangan lokal.'));
+      return;
+    }
     const request = indexedDB.open('ingco-meeting-backup-v1', 1);
     request.onupgradeneeded = () => {
       const db = request.result;
@@ -142,6 +167,7 @@
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
+
   const transact = async (store, mode, fn) => {
     const db = await openDb();
     return new Promise((resolve, reject) => {
@@ -154,6 +180,7 @@
       transaction.onabort = () => { db.close(); reject(transaction.error); };
     });
   };
+
   const requestStore = async (store, operation) => {
     const db = await openDb();
     return new Promise((resolve, reject) => {
@@ -165,71 +192,174 @@
       tx.onerror = () => db.close();
     });
   };
+
   const getState = () => requestStore('state', s => s.get('active'));
   const saveState = state => transact('state', 'readwrite', s => s.put({ ...state, key: 'active' }));
   const clearState = () => transact('state', 'readwrite', s => s.delete('active'));
-  const savePart = (uuid, n, blob, mime) => transact('parts', 'readwrite', s => s.put({ key: uuid + ':' + n, meetingId: uuid, sequence: n, blob, mime }));
+  const savePart = (uuid, n, blob, mime) => transact('parts', 'readwrite', s => s.put({
+    key: uuid + ':' + n, meetingId: uuid, sequence: n, blob, mime
+  }));
   const removePart = key => transact('parts', 'readwrite', s => s.delete(key));
   const allParts = async uuid => {
     const parts = await requestStore('parts', s => s.index('meetingId').getAll(uuid));
-    return parts.sort((a,b) => a.sequence - b.sequence);
+    return parts.sort((a, b) => a.sequence - b.sequence);
   };
-  const setError = message => { $('recorder-error').textContent = message; $('recorder-error').classList.remove('hidden'); };
+
+  const setError = message => {
+    $('recorder-error').textContent = message;
+    $('recorder-error').classList.remove('hidden');
+  };
   const clearError = () => $('recorder-error').classList.add('hidden');
-  const notify = message => { $('recorder-success').textContent = message; $('recorder-success').classList.remove('hidden'); };
+  const notify = message => {
+    $('recorder-success').textContent = message;
+    $('recorder-success').classList.remove('hidden');
+  };
   const hideNotification = () => $('recorder-success').classList.add('hidden');
-  const formatTime = seconds => { const s = Math.max(0, Math.floor(seconds)); return [Math.floor(s/3600), Math.floor(s/60)%60, s%60].map(x=>String(x).padStart(2,'0')).join(':'); };
-  const jsonCall = async (url, options={}) => {
+
+  const formatTime = seconds => {
+    const s = Math.max(0, Math.floor(seconds));
+    return [Math.floor(s / 3600), Math.floor(s / 60) % 60, s % 60]
+      .map(x => String(x).padStart(2, '0')).join(':');
+  };
+
+  const jsonCall = async (url, options = {}) => {
     const headers = { 'X-CSRF-TOKEN': csrf, 'Accept': 'application/json', ...options.headers };
     const res = await fetch(url, { credentials: 'same-origin', ...options, headers });
     const text = await res.text(); let obj;
-    try { obj = JSON.parse(text); } catch (e) { throw new Error('Respons server bukan JSON. Cek login, APP_DEBUG dan laravel.log (HTTP '+res.status+').'); }
+    try { obj = JSON.parse(text); }
+    catch (e) {
+      throw new Error('Respons server bukan JSON. Cek login, APP_DEBUG dan laravel.log (HTTP ' + res.status + ').');
+    }
     if (!res.ok) {
       const message = obj.error || obj.message || (obj.errors ? Object.values(obj.errors).flat().join('; ') : null);
-      throw new Error(message || 'Server gagal dengan HTTP '+res.status);
+      throw new Error(message || 'Server gagal dengan HTTP ' + res.status);
     }
     return obj;
   };
+
+  const requestWakeLock = async (showWarning = false) => {
+    if (!active || active.phase !== 'recording' || document.visibilityState !== 'visible') return false;
+
+    if (!navigator.wakeLock?.request) {
+      if (showWarning && !wakeLockWarningShown) {
+        wakeLockWarningShown = true;
+        notify('Browser ini tidak mendukung Screen Wake Lock. Matikan auto-lock layar selama meeting agar rekaman tidak terputus.');
+      }
+      return false;
+    }
+
+    try {
+      if (wakeLock && !wakeLock.released) return true;
+
+      const sentinel = await navigator.wakeLock.request('screen');
+      wakeLock = sentinel;
+      sentinel.addEventListener('release', () => {
+        if (wakeLock === sentinel) wakeLock = null;
+        if (active?.phase === 'recording' && document.visibilityState === 'visible' && !manualStopRequested) {
+          setTimeout(() => requestWakeLock(false), 250);
+        }
+      }, { once: true });
+      return true;
+    } catch (err) {
+      wakeLock = null;
+      if (showWarning && !wakeLockWarningShown) {
+        wakeLockWarningShown = true;
+        notify('Tidak bisa menahan layar tetap menyala di browser ini. Rekaman tetap berjalan selama browser/OS tidak menonaktifkan mikrofon.');
+      }
+      return false;
+    }
+  };
+
+  const releaseWakeLock = async () => {
+    const sentinel = wakeLock;
+    wakeLock = null;
+    try {
+      if (sentinel && !sentinel.released) await sentinel.release();
+    } catch (_) {}
+  };
+
+  const stopCurrentStream = async (targetStream = stream, releaseScreenLock = false) => {
+    await stopMeter();
+    if (targetStream) {
+      try { targetStream.getTracks().forEach(track => track.stop()); } catch (_) {}
+      if (stream === targetStream) stream = null;
+    }
+    if (releaseScreenLock) await releaseWakeLock();
+  };
+
   const render = async () => {
-    const isRecording = !!recorder && recorder.state === 'recording';
-    micButton.disabled = !!active && !isRecording;
-    micButton.setAttribute('aria-label', isRecording ? 'Selesai merekam dan buat notulen' : 'Mulai merekam');
-    micButton.title = isRecording ? 'Ketuk untuk berhenti dan buat notulen' : 'Ketuk untuk mulai merekam';
-    $('mic-action-label').textContent = isRecording ? 'Ketuk mikrofon untuk berhenti' : active ? 'Sedang sinkronisasi rekaman...' : 'Ketuk mikrofon untuk mulai';
-    $('mic-circle').classList.toggle('recording', isRecording);
-    $('record-badge').textContent = isRecording ? '● Merekam' : active ? 'Sinkronisasi' : 'Siap merekam';
-    $('record-state').textContent = isRecording ? 'Mikrofon aktif • jangan tutup halaman' : active ? 'Mengirim cadangan / menyiapkan notulen' : 'Mikrofon belum aktif';
+    const recording = isRecording();
+    const interrupted = !!active && active.phase === 'recording' && !recording;
+    const finishing = !!active && active.phase === 'finishing';
+
+    micButton.disabled = resumeBusy || finishing;
+    micButton.setAttribute(
+      'aria-label',
+      recording ? 'Selesai merekam dan buat notulen'
+        : interrupted ? 'Lanjutkan rekaman'
+          : 'Mulai merekam'
+    );
+    micButton.title = recording ? 'Ketuk untuk berhenti dan buat notulen'
+      : interrupted ? 'Ketuk untuk mengaktifkan mikrofon dan melanjutkan rekaman'
+        : 'Ketuk untuk mulai merekam';
+
+    $('mic-action-label').textContent = recording ? 'Ketuk mikrofon untuk berhenti'
+      : interrupted ? (resumeBusy ? 'Mencoba mengaktifkan mikrofon kembali...' : 'Ketuk mikrofon untuk melanjutkan rekaman')
+        : finishing ? 'Sedang sinkronisasi rekaman...'
+          : 'Ketuk mikrofon untuk mulai';
+
+    $('mic-circle').classList.toggle('recording', recording);
+    $('record-badge').textContent = recording ? '● Merekam'
+      : interrupted ? '⚠ Mic terputus'
+        : finishing ? 'Sinkronisasi'
+          : 'Siap merekam';
+
+    $('record-state').textContent = recording
+      ? 'Mikrofon aktif • layar dijaga tetap menyala bila browser mendukung'
+      : interrupted
+        ? 'Mikrofon tidak aktif • buka layar lalu ketuk mikrofon bila tidak pulih otomatis'
+        : finishing
+          ? 'Mengirim cadangan / menyiapkan notulen'
+          : 'Mikrofon belum aktif';
+
     if (active) {
       const pending = (await allParts(active.uuid)).length;
-      $('record-pending').textContent = 'Cadangan lokal: '+pending;
-      $('record-uploaded').textContent = String(Math.max(0, (active.nextSequence||0) - pending));
+      $('record-pending').textContent = 'Cadangan lokal: ' + pending;
+      $('record-uploaded').textContent = String(Math.max(0, (active.nextSequence || 0) - pending));
     } else {
       $('record-pending').textContent = 'Cadangan lokal: 0';
     }
   };
-  const stopTimer = () => { if (ticking) clearInterval(ticking); ticking = null; };
+
+  const stopTimer = () => {
+    if (ticking) clearInterval(ticking);
+    ticking = null;
+  };
+
   const startTimer = () => {
     stopTimer();
-    ticking = setInterval(() => { if (active?.started) $('record-timer').textContent = formatTime(dateStart()/1000); },1000);
+    ticking = setInterval(() => {
+      if (active?.started) $('record-timer').textContent = formatTime(dateStart() / 1000);
+    }, 1000);
   };
-  const releaseMic = async () => {
-    await stopMeter();
-    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
-    try { if (wakeLock) await wakeLock.release(); } catch (e) {}
-    wakeLock = null;
-  };
-  const queuePart = evt => {
+
+  const queuePart = (evt, sourceRecorder = recorder) => {
     if (!evt.data || !evt.data.size || !active) return;
     const session = active, n = sequence++;
     session.nextSequence = sequence;
-    const mime = recorder?.mimeType || evt.data.type || 'audio/webm';
-    const promise = savePart(session.uuid,n,evt.data,mime)
+    const mime = sourceRecorder?.mimeType || evt.data.type || 'audio/webm';
+
+    const promise = savePart(session.uuid, n, evt.data, mime)
       .then(() => saveState(session))
       .then(() => uploadPending())
-      .catch(err => setError('Cadangan audio #'+n+' gagal disimpan: '+err.message));
+      .catch(err => setError('Cadangan audio #' + n + ' gagal disimpan: ' + err.message));
+
     persistTasks.push(promise);
-    promise.finally(() => { persistTasks = persistTasks.filter(p => p !== promise); });
+    promise.finally(() => {
+      persistTasks = persistTasks.filter(p => p !== promise);
+    });
   };
+
   const uploadPending = async () => {
     if (uploadBusy || !active) return;
     uploadBusy = true;
@@ -239,142 +369,491 @@
       for (const part of pending) {
         const form = new FormData();
         const ext = part.mime.includes('mp4') ? 'mp4' : (part.mime.includes('ogg') ? 'ogg' : 'webm');
-        form.append('sequence',String(part.sequence));
-        form.append('mime_type',part.mime);
-        form.append('audio',part.blob,'chunk-'+part.sequence+'.'+ext);
+        form.append('sequence', String(part.sequence));
+        form.append('mime_type', part.mime);
+        form.append('audio', part.blob, 'chunk-' + part.sequence + '.' + ext);
         try {
-          await jsonCall(base+'/'+session.uuid+'/chunks', { method:'POST',body:form });
+          await jsonCall(base + '/' + session.uuid + '/chunks', { method: 'POST', body: form });
           await removePart(part.key);
           clearError();
         } catch (err) {
-          setError('Upload terhenti: '+err.message+' Audio yang belum terkirim tetap ada di perangkat dan akan dicoba lagi.');
+          setError('Upload terhenti: ' + err.message + ' Audio yang belum terkirim tetap ada di perangkat dan akan dicoba lagi.');
           break;
         }
       }
       await render();
-    } catch (err) { setError('Sinkronisasi gagal: '+err.message); }
-    finally { uploadBusy = false; }
+    } catch (err) {
+      setError('Sinkronisasi gagal: ' + err.message);
+    } finally {
+      uploadBusy = false;
+    }
   };
+
   const attemptFinish = async () => {
     if (!active || active.phase !== 'finishing' || finalizeBusy || uploadBusy) return;
     finalizeBusy = true;
     try {
       await uploadPending();
       const pending = await allParts(active.uuid);
-      if (pending.length) { recoveryNotice.classList.remove('hidden'); return; }
-      if (!active.nextSequence) { setError('Belum ada audio yang berhasil direkam. Coba merekam ulang.'); return; }
+      if (pending.length) {
+        recoveryNotice.classList.remove('hidden');
+        return;
+      }
+      if (!active.nextSequence) {
+        setError('Belum ada audio yang berhasil direkam. Coba merekam ulang.');
+        return;
+      }
+
       const uuid = active.uuid;
-      const result = await jsonCall(base+'/'+uuid+'/finish',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({expected_chunks:active.nextSequence})});
+      const result = await jsonCall(base + '/' + uuid + '/finish', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expected_chunks: active.nextSequence }),
+      });
+
       if (result.ok) {
         await clearState();
         active = null;
-        stopTimer(); recoveryNotice.classList.add('hidden'); clearError();
+        stopTimer();
+        recoveryNotice.classList.add('hidden');
+        clearError();
         notify('Rekaman berhasil disimpan. Notulen sedang diproses oleh server.');
-        window.location.assign(base+'/'+uuid);
+        window.location.assign(base + '/' + uuid);
       }
-    } catch(err) { setError('Belum bisa menyelesaikan meeting: '+err.message+' Coba sinkronkan ulang.'); recoveryNotice.classList.remove('hidden'); }
-    finally { finalizeBusy = false; await render(); }
+    } catch (err) {
+      setError('Belum bisa menyelesaikan meeting: ' + err.message + ' Coba sinkronkan ulang.');
+      recoveryNotice.classList.remove('hidden');
+    } finally {
+      finalizeBusy = false;
+      await render();
+    }
   };
+
+  const chooseMime = () => {
+    const supported = [
+      'audio/webm;codecs=opus',
+      'audio/mp4;codecs=mp4a.40.2',
+      'audio/mp4',
+      'audio/webm',
+      'video/webm;codecs=vp8,opus',
+    ];
+    return supported.find(type => MediaRecorder.isTypeSupported(type)) || '';
+  };
+
+  const createMediaRecorder = audioStream => {
+    const mime = chooseMime();
+    return new MediaRecorder(
+      audioStream,
+      mime ? { mimeType: mime, audioBitsPerSecond: 64000 } : { audioBitsPerSecond: 64000 }
+    );
+  };
+
+  const trackLooksHealthy = audioStream => {
+    const tracks = audioStream?.getAudioTracks?.() || [];
+    return tracks.some(track => track.readyState === 'live' && !track.muted);
+  };
+
+  const flushRecorder = () => {
+    try {
+      if (recorder?.state === 'recording') recorder.requestData();
+    } catch (_) {}
+  };
+
+  const resumeRecording = async (userInitiated = false) => {
+    if (!active || active.phase !== 'recording' || isRecording() || resumeBusy || manualStopRequested) return;
+
+    resumeBusy = true;
+    let acquiredStream = null;
+    await render();
+
+    try {
+      acquiredStream = await navigator.mediaDevices.getUserMedia(audioConstraints);
+      if (!active || active.phase !== 'recording' || manualStopRequested) {
+        acquiredStream.getTracks().forEach(track => track.stop());
+        acquiredStream = null;
+        return;
+      }
+      const newStream = acquiredStream;
+      const newRecorder = createMediaRecorder(newStream);
+
+      stream = newStream;
+      acquiredStream = null;
+      recorder = newRecorder;
+      active.interrupted = false;
+      active.nextSequence = sequence;
+
+      newRecorder.addEventListener('dataavailable', evt => queuePart(evt, newRecorder));
+      newRecorder.addEventListener('error', e => {
+        setError('Browser gagal merekam: ' + (e.error?.message || 'unknown'));
+      });
+
+      newRecorder.addEventListener('stop', async () => {
+        if (
+          manualStopRequested ||
+          !active ||
+          active.phase !== 'recording' ||
+          recorder !== newRecorder
+        ) return;
+
+        await handleUnexpectedStop(newRecorder, newStream);
+      });
+
+      newStream.getAudioTracks().forEach(track => {
+        track.addEventListener('ended', () => {
+          if (recorder === newRecorder && newRecorder.state === 'recording' && !manualStopRequested) {
+            try { newRecorder.stop(); } catch (_) {}
+          }
+        });
+
+        track.addEventListener('mute', () => {
+          if (recorder === newRecorder && active?.phase === 'recording') {
+            setMeterLabel('Input mikrofon ditahan sementara oleh browser / sistem', 'MIC PAUSE', false, false);
+          }
+        });
+
+        track.addEventListener('unmute', () => {
+          if (recorder === newRecorder && active?.phase === 'recording') {
+            setMeterLabel('Mikrofon aktif kembali', 'INPUT AKTIF', false, true);
+          }
+        });
+      });
+
+      newRecorder.start(15000);
+      await saveState(active);
+      await requestWakeLock(userInitiated);
+      await startMeter(newStream);
+
+      clearError();
+      recoveryNotice.classList.add('hidden');
+      notify(userInitiated
+        ? 'Rekaman dilanjutkan. Mikrofon aktif kembali.'
+        : 'Mikrofon aktif kembali dan rekaman dilanjutkan otomatis.');
+    } catch (err) {
+      if (acquiredStream) {
+        try { acquiredStream.getTracks().forEach(track => track.stop()); } catch (_) {}
+      }
+      recorder = null;
+      await stopCurrentStream(stream, false);
+      setError(
+        'Mikrofon sempat terputus dan belum bisa aktif kembali. ' +
+        'Buka layar / kembali ke halaman ini lalu ketuk tombol mikrofon untuk melanjutkan. ' +
+        'Audio selama mikrofon terputus mungkin tidak terekam. (' + err.message + ')'
+      );
+    } finally {
+      resumeBusy = false;
+      await render();
+    }
+  };
+
+  async function handleUnexpectedStop(stoppedRecorder, stoppedStream) {
+    if (unexpectedStopBusy || manualStopRequested || !active || active.phase !== 'recording') return;
+    unexpectedStopBusy = true;
+    let shouldResume = false;
+
+    try {
+      await Promise.allSettled(persistTasks);
+
+      if (recorder === stoppedRecorder) recorder = null;
+      await stopCurrentStream(stoppedStream, false);
+
+      active.interrupted = true;
+      active.nextSequence = sequence;
+      await saveState(active);
+
+      setError(
+        'Mikrofon / browser menghentikan rekaman sementara. ' +
+        'Bagian yang sudah direkam tetap disimpan. Saat layar aktif kembali sistem akan mencoba melanjutkan otomatis; ' +
+        'jika belum aktif, ketuk tombol mikrofon. Audio ketika mikrofon dihentikan OS tidak dapat dipulihkan.'
+      );
+      recoveryNotice.classList.remove('hidden');
+      $('recovery-text').textContent =
+        'Mikrofon terputus. Sistem akan mencoba melanjutkan rekaman. Jika Anda ingin mengakhiri meeting dengan audio yang sudah tersimpan, gunakan tombol di bawah.';
+      shouldResume = document.visibilityState === 'visible';
+    } catch (err) {
+      setError('Pemulihan mikrofon gagal: ' + err.message);
+    } finally {
+      unexpectedStopBusy = false;
+      await render();
+    }
+
+    if (shouldResume) await resumeRecording(false);
+  }
+
   const stopRecording = async () => {
     if (!recorder || recorder.state !== 'recording') return;
     micButton.disabled = true;
     manualStopRequested = true;
+    const stoppingRecorder = recorder;
+
     try {
+      flushRecorder();
       await new Promise(resolve => {
-        recorder.addEventListener('stop', resolve, { once:true });
-        recorder.stop();
+        stoppingRecorder.addEventListener('stop', resolve, { once: true });
+        stoppingRecorder.stop();
       });
+
       await Promise.allSettled(persistTasks);
-      await releaseMic();
-      if (active) { active.phase = 'finishing'; active.nextSequence = sequence; await saveState(active); }
-      await render();
-      await attemptFinish();
-    } catch(err) { setError('Gagal menghentikan rekaman: '+err.message); }
-    finally { recorder = null; manualStopRequested = false; await render(); }
-  };
-  const chooseMime = () => {
-    const supported = ['audio/webm;codecs=opus','audio/mp4;codecs=mp4a.40.2','audio/mp4','audio/webm','video/webm;codecs=vp8,opus'];
-    return supported.find(type => MediaRecorder.isTypeSupported(type)) || '';
-  };
-  const startRecording = async () => {
-    clearError(); hideNotification();
-    if (active) { setError('Selesaikan meeting sebelumnya sebelum mulai yang baru.'); return; }
-    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) { setError('Browser tidak mendukung perekaman. Gunakan Chrome Android/Safari terbaru melalui HTTPS atau localhost.'); return; }
-    micButton.disabled = true;
-    let meetingCreated = false;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({video:false,audio:{echoCancellation:true,noiseSuppression:true,channelCount:1}});
-      const mime = chooseMime();
-      recorder = new MediaRecorder(stream, mime ? {mimeType:mime,audioBitsPerSecond:64000} : {audioBitsPerSecond:64000});
-      const meeting = await jsonCall(root.dataset.createUrl, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:$('meeting-title').value})});
-      meetingCreated = true;
-      sequence=0; manualStopRequested=false;
-      active = {uuid:meeting.uuid,title:$('meeting-title').value,started:Date.now(),nextSequence:0,phase:'recording'};
-      await saveState(active);
-      recorder.addEventListener('dataavailable',queuePart);
-      recorder.addEventListener('error', e => setError('Browser gagal merekam: '+(e.error?.message||'unknown')));
-      recorder.addEventListener('stop', async () => {
-        if (!manualStopRequested && active?.phase === 'recording') {
-          setError('Mikrofon / browser menghentikan rekaman. Menyimpan bagian yang sudah ada.');
-          await Promise.allSettled(persistTasks);
-          await releaseMic();
-          active.phase = 'finishing'; active.nextSequence = sequence;
-          try { await saveState(active); await render(); await attemptFinish(); }
-          catch(e) { setError('Pemulihan otomatis gagal: '+e.message); }
-        }
-      });
-      stream.getAudioTracks().forEach(track => track.addEventListener('ended', () => {
-        if (recorder?.state === 'recording') recorder.stop();
-      }));
-      recorder.start(15000);
-      await startMeter(stream);
-      try { if (navigator.wakeLock) wakeLock=await navigator.wakeLock.request('screen'); } catch(e) {}
-      $('record-timer').textContent='00:00:00'; startTimer(); await render();
-      notify('Rekaman aktif. Pertahankan halaman ini terbuka dan layar tetap menyala.');
-    } catch(err) {
-      await releaseMic();
-      setError((meetingCreated ? 'Meeting sudah dibuat, tetapi perekaman gagal. ' : '')+err.message);
-      if (!meetingCreated) recorder=null;
-    } finally { await render(); }
-  };
-  const recover = async () => {
-    try {
-      if (!active) active=await getState();
-      if (!active) return;
-      if (active.phase==='recording') {
-        active.phase='finishing';
+      await stopCurrentStream(stream, true);
+
+      if (active) {
+        active.phase = 'finishing';
+        active.interrupted = false;
+        active.nextSequence = sequence;
         await saveState(active);
       }
+
+      recorder = null;
+      await render();
+      await attemptFinish();
+    } catch (err) {
+      setError('Gagal menghentikan rekaman: ' + err.message);
+    } finally {
+      recorder = null;
+      manualStopRequested = false;
+      await render();
+    }
+  };
+
+  const startRecording = async () => {
+    clearError();
+    hideNotification();
+
+    if (active) {
+      setError('Selesaikan meeting sebelumnya sebelum mulai yang baru.');
+      return;
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+      setError('Browser tidak mendukung perekaman. Gunakan Chrome Android/Safari terbaru melalui HTTPS atau localhost.');
+      return;
+    }
+
+    micButton.disabled = true;
+    let meetingCreated = false;
+    let firstStream = null;
+
+    try {
+      firstStream = await navigator.mediaDevices.getUserMedia(audioConstraints);
+
+      const meeting = await jsonCall(root.dataset.createUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: $('meeting-title').value }),
+      });
+
+      meetingCreated = true;
+      sequence = 0;
+      manualStopRequested = false;
+      active = {
+        uuid: meeting.uuid,
+        title: $('meeting-title').value,
+        started: Date.now(),
+        nextSequence: 0,
+        phase: 'recording',
+        interrupted: false,
+      };
+      await saveState(active);
+
+      stream = firstStream;
+      firstStream = null;
+      const recordingStream = stream;
+      const newRecorder = createMediaRecorder(recordingStream);
+      recorder = newRecorder;
+
+      newRecorder.addEventListener('dataavailable', evt => queuePart(evt, newRecorder));
+      newRecorder.addEventListener('error', e => {
+        setError('Browser gagal merekam: ' + (e.error?.message || 'unknown'));
+      });
+
+      newRecorder.addEventListener('stop', async () => {
+        if (
+          manualStopRequested ||
+          !active ||
+          active.phase !== 'recording' ||
+          recorder !== newRecorder
+        ) return;
+
+        await handleUnexpectedStop(newRecorder, recordingStream);
+      });
+
+      recordingStream.getAudioTracks().forEach(track => {
+        track.addEventListener('ended', () => {
+          if (recorder === newRecorder && newRecorder.state === 'recording' && !manualStopRequested) {
+            try { newRecorder.stop(); } catch (_) {}
+          }
+        });
+
+        track.addEventListener('mute', () => {
+          if (recorder === newRecorder && active?.phase === 'recording') {
+            setMeterLabel('Input mikrofon ditahan sementara oleh browser / sistem', 'MIC PAUSE', false, false);
+          }
+        });
+
+        track.addEventListener('unmute', () => {
+          if (recorder === newRecorder && active?.phase === 'recording') {
+            setMeterLabel('Mikrofon aktif kembali', 'INPUT AKTIF', false, true);
+          }
+        });
+      });
+
+      newRecorder.start(15000);
+
+      await requestWakeLock(true);
+      await startMeter(recordingStream);
+
+      $('record-timer').textContent = '00:00:00';
+      startTimer();
+      await render();
+
+      notify(
+        navigator.wakeLock?.request
+          ? 'Rekaman aktif. Sistem akan menjaga layar tetap menyala selama browser mengizinkan.'
+          : 'Rekaman aktif. Browser ini tidak mendukung Screen Wake Lock; matikan auto-lock layar selama meeting.'
+      );
+    } catch (err) {
+      if (firstStream) {
+        try { firstStream.getTracks().forEach(track => track.stop()); } catch (_) {}
+      }
+      await stopCurrentStream(stream, true);
+      setError((meetingCreated ? 'Meeting sudah dibuat, tetapi perekaman gagal. ' : '') + err.message);
+
+      if (!meetingCreated) {
+        recorder = null;
+      } else if (active?.phase === 'recording') {
+        active.interrupted = true;
+        active.nextSequence = sequence;
+        try { await saveState(active); } catch (_) {}
+      }
+    } finally {
+      await render();
+    }
+  };
+
+  const ensureCaptureAfterForeground = async () => {
+    if (!active || active.phase !== 'recording' || manualStopRequested) return;
+
+    await requestWakeLock(false);
+
+    try {
+      if (meterContext?.state === 'suspended') await meterContext.resume();
+    } catch (_) {}
+
+    if (!isRecording()) {
+      await resumeRecording(false);
+      return;
+    }
+
+    setTimeout(async () => {
+      if (!active || active.phase !== 'recording' || manualStopRequested || !isRecording()) return;
+      if (trackLooksHealthy(stream)) return;
+
+      const unhealthyRecorder = recorder;
+      try { unhealthyRecorder.requestData(); } catch (_) {}
+      try { unhealthyRecorder.stop(); }
+      catch (_) {
+        if (recorder === unhealthyRecorder) recorder = null;
+        await resumeRecording(false);
+      }
+    }, 700);
+  };
+
+  const recover = async () => {
+    try {
+      if (!active) active = await getState();
+      if (!active) return;
+
+      if (active.phase === 'recording') {
+        active.phase = 'finishing';
+        active.interrupted = false;
+        await saveState(active);
+      }
+
       recoveryNotice.classList.remove('hidden');
       recoverButton.disabled = true;
       await uploadPending();
       await attemptFinish();
-    } catch(e) { setError('Pemulihan gagal: '+e.message); }
-    finally { recoverButton.disabled = false; }
+    } catch (e) {
+      setError('Pemulihan gagal: ' + e.message);
+    } finally {
+      recoverButton.disabled = false;
+    }
   };
+
   const init = async () => {
     try {
       active = await getState();
       if (active) {
-        sequence = active.nextSequence||0;
+        sequence = active.nextSequence || 0;
         recoveryNotice.classList.remove('hidden');
-        $('recovery-text').textContent='Ditemukan meeting "'+(active.title||'Tanpa judul')+'". Rekaman yang sudah tersimpan di perangkat akan dikirim ulang. Bagian yang tidak sempat tersimpan tidak dapat dipulihkan.';
-        active.phase='finishing'; await saveState(active);
-        await render(); await recover();
-      } else await render();
-    } catch(e) { setError('Tidak bisa membaca penyimpanan lokal: '+e.message); micButton.disabled = true; }
-    setInterval(async()=>{ if (!active) return; await uploadPending(); if (active?.phase==='finishing') await attemptFinish(); },8000);
+        $('recovery-text').textContent =
+          'Ditemukan meeting "' + (active.title || 'Tanpa judul') +
+          '". Rekaman yang sudah tersimpan di perangkat akan dikirim ulang. ' +
+          'Bagian yang tidak sempat tersimpan tidak dapat dipulihkan.';
+        active.phase = 'finishing';
+        active.interrupted = false;
+        await saveState(active);
+        await render();
+        await recover();
+      } else {
+        await render();
+      }
+    } catch (e) {
+      setError('Tidak bisa membaca penyimpanan lokal: ' + e.message);
+      micButton.disabled = true;
+    }
+
+    setInterval(async () => {
+      if (!active) return;
+      await uploadPending();
+      if (active?.phase === 'finishing') await attemptFinish();
+    }, 8000);
   };
+
   micButton.addEventListener('click', () => {
-    if (recorder?.state === 'recording') stopRecording();
-    else if (!active) startRecording();
+    if (isRecording()) {
+      stopRecording();
+    } else if (active?.phase === 'recording') {
+      resumeRecording(true);
+    } else if (!active) {
+      startRecording();
+    }
   });
+
   recoverButton.addEventListener('click', recover);
-  window.addEventListener('online', async()=>{ if(active) { await uploadPending(); await attemptFinish(); }});
-  window.addEventListener('beforeunload', e=>{ if(recorder?.state==='recording'){e.preventDefault();e.returnValue='Rekaman sedang berlangsung.';} });
-  document.addEventListener('visibilitychange', ()=>{
-    if (document.hidden && recorder?.state==='recording') notify('Peringatan: browser mobile dapat menghentikan rekaman di background.');
+
+  window.addEventListener('online', async () => {
+    if (!active) return;
+    await uploadPending();
+    if (active?.phase === 'finishing') await attemptFinish();
   });
+
+  window.addEventListener('beforeunload', e => {
+    if (isRecording()) {
+      flushRecorder();
+      e.preventDefault();
+      e.returnValue = 'Rekaman sedang berlangsung.';
+    }
+  });
+
+  window.addEventListener('pagehide', () => {
+    flushRecorder();
+  });
+
+  document.addEventListener('visibilitychange', async () => {
+    if (document.hidden) {
+      if (isRecording()) {
+        flushRecorder();
+        if (active) {
+          active.lastBackgroundAt = Date.now();
+          try { await saveState(active); } catch (_) {}
+        }
+      }
+      return;
+    }
+
+    await ensureCaptureAfterForeground();
+  });
+
   drawMeter();
   init();
 })();
